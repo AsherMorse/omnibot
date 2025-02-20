@@ -7,11 +7,30 @@ import queue
 import threading
 import os
 import tempfile
+import io
 from openai import OpenAI
 from dotenv import load_dotenv
+from elevenlabs.client import ElevenLabs
+from elevenlabs import play
+from pydub import AudioSegment
 
 # Load environment variables
 load_dotenv()
+
+# Set up Eleven Labs
+eleven_api_key = os.getenv('ELEVEN_LABS_API_KEY')
+if not eleven_api_key:
+    raise ValueError("Eleven Labs API key not found. Please set ELEVEN_LABS_API_KEY in your .env file")
+
+try:
+    client = ElevenLabs(api_key=eleven_api_key)
+    print("Successfully initialized Eleven Labs API")
+except Exception as e:
+    raise ValueError(f"Failed to initialize Eleven Labs API: {str(e)}")
+
+VOICE_ID = os.getenv('ELEVEN_LABS_VOICE_ID')
+if not VOICE_ID:
+    raise ValueError("Eleven Labs Voice ID not found. Please set ELEVEN_LABS_VOICE_ID in your .env file")
 
 # Audio parameters
 SAMPLE_RATE = 48000
@@ -31,6 +50,7 @@ class AudioLoopback:
         self.recorded_audio = []
         self.playback_position = 0
         self.temp_wav_path = None
+        self.temp_mp3_path = None
         
         # Initialize OpenAI client
         api_key = os.getenv('OPENAI_API_KEY')
@@ -64,9 +84,9 @@ class AudioLoopback:
                     print("\nRecording stopped.")
                     if len(self.recorded_audio) > 0:
                         self.prepare_playback()
-                        self.transcribe_audio()
-                        self.is_playing = True
-                        print("\nPlayback started...")
+                        transcript = self.transcribe_audio()
+                        if transcript:
+                            self.synthesize_and_play(transcript)
             elif key == keyboard.Key.enter and self.is_playing:
                 # Toggle pause/resume during playback
                 self.is_paused = not self.is_paused
@@ -81,11 +101,12 @@ class AudioLoopback:
 
     def cleanup(self):
         """Clean up temporary files"""
-        if self.temp_wav_path and os.path.exists(self.temp_wav_path):
-            try:
-                os.remove(self.temp_wav_path)
-            except Exception as e:
-                print(f"Error cleaning up temporary file: {e}")
+        for path in [self.temp_wav_path, self.temp_mp3_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    print(f"Error cleaning up temporary file: {e}")
 
     def save_to_temp_wav(self):
         """Save the recorded audio to a temporary WAV file"""
@@ -104,7 +125,7 @@ class AudioLoopback:
         """Transcribe the recorded audio using OpenAI's Whisper API"""
         try:
             if not self.save_to_temp_wav():
-                return
+                return None
 
             print("\nTranscribing audio...")
             
@@ -119,8 +140,81 @@ class AudioLoopback:
             print(transcript.text)
             print("-" * 50)
             
+            return transcript.text
+            
         except Exception as e:
             print(f"Error during transcription: {e}")
+            return None
+        finally:
+            self.cleanup()
+
+    def synthesize_and_play(self, text):
+        """Synthesize speech using Eleven Labs and play it"""
+        try:
+            print("\nGenerating speech with Eleven Labs...")
+            
+            # Generate audio using Eleven Labs with a timeout
+            try:
+                audio_data = client.text_to_speech.convert(
+                    text=text,
+                    voice_id=VOICE_ID,
+                    model_id="eleven_multilingual_v2",
+                    output_format="mp3_44100_128"
+                )
+                
+                # Convert generator to bytes if needed
+                if hasattr(audio_data, '__iter__'):
+                    audio_bytes = b''.join(chunk for chunk in audio_data)
+                else:
+                    audio_bytes = audio_data
+                
+                if not audio_bytes:
+                    raise Exception("No audio data received from Eleven Labs")
+                
+                # Save the raw Eleven Labs output to a file
+                output_file = "elevenlabs_output.mp3"
+                with open(output_file, "wb") as f:
+                    f.write(audio_bytes)
+                print(f"\nSaved Eleven Labs audio to {output_file}")
+                
+            except Exception as e:
+                print(f"Failed to generate speech with Eleven Labs: {str(e)}")
+                return
+            
+            # Save MP3 data to a temporary file
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_mp3:
+                self.temp_mp3_path = temp_mp3.name
+                temp_mp3.write(audio_bytes)
+                temp_mp3.flush()
+            
+            print("Converting audio format...")
+            # Convert MP3 to WAV using pydub
+            audio = AudioSegment.from_mp3(self.temp_mp3_path)
+            audio = audio.set_frame_rate(SAMPLE_RATE)
+            audio = audio.set_channels(CHANNELS)
+            
+            # Export as WAV
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+                self.temp_wav_path = temp_wav.name
+                audio.export(self.temp_wav_path, format='wav')
+            
+            # Read the WAV file
+            _, audio_data = read(self.temp_wav_path)
+            
+            # Convert to float32 and normalize
+            audio_array = audio_data.astype(np.float32)
+            if audio_array.max() > 0:
+                audio_array = audio_array / 32768.0  # Normalize 16-bit audio
+            
+            # Update audio data for playback
+            self.audio_data = audio_array
+            self.playback_position = 0
+            self.is_playing = True
+            print("\nPlaying synthesized speech...")
+            
+        except Exception as e:
+            print(f"Error synthesizing speech: {str(e)}")
+            self.is_playing = False
         finally:
             self.cleanup()
 
